@@ -13,12 +13,14 @@ CREATE TABLE IF NOT EXISTS assets (
     asset_type TEXT NOT NULL,
     description TEXT,
     estimated_value INTEGER,
-    geom_point geometry(point, 4326),
-    geom_line geometry(linestring, 4326),
+    geom geometry(Geometry, 4326) NOT NULL,
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    CONSTRAINT check_geom CHECK (geom_point IS NOT NULL OR geom_line IS NOT NULL)
+    CONSTRAINT check_geom
+    CHECK (
+        (GeometryType(geom) IN ('POINT', 'LINESTRING'))
+    )
 );
 
 CREATE TABLE IF NOT EXISTS issues (
@@ -56,5 +58,4 @@ CREATE TABLE IF NOT EXISTS inspections (
     created TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_assets_geom ON assets USING GIST(geom_point);
-CREATE INDEX IF NOT EXISTS idx_assets_geom ON assets USING GIST(geom_line);
+CREATE INDEX IF NOT EXISTS idx_assets_geom ON assets USING GIST(geom);
