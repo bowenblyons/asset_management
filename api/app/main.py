@@ -6,8 +6,8 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 import psycopg
-from psycopg import sql
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from uuid import UUID
 
 
 app = FastAPI(title="Asset Management API")
@@ -19,9 +19,7 @@ def get_dsn() -> str:
     dbname = os.environ["DB_NAME"]
     user = os.environ["DB_USER"]
     password = os.environ["DB_PASSWORD"]
-    return (
-        f"host={host} port={port} dbname={dbname} " f"user={user} password={password}"
-    )
+    return f"host={host} port={port} dbname={dbname} user={user} password={password}"
 
 
 @contextmanager
@@ -41,14 +39,18 @@ class HealthResponse(BaseModel):
 class EmployeesCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    first_name: str = Field(min_length=1, max_length=50)
-    last_name: str = Field(min_length=1, max_length=50)
+    first_name: str = Field(min_length=1, max_length=20)
+    last_name: str = Field(min_length=1, max_length=20)
+    eid: str = Field(min_length=1, max_length=50)
+    email: str = Field(min_length=1, max_length=50)
 
 
 class EmployeesOut(BaseModel):
-    id: int
+    id: UUID
+    eid: str
     first_name: str
     last_name: str
+    email: str
     deleted_at: Optional[datetime]
     created: datetime
 
@@ -117,7 +119,7 @@ class LineGeometryOut(BaseModel):
 
 
 class AssetsOut(BaseModel):
-    id: int
+    id: UUID
     asset_type: str
     description: str
     estimated_value: int
@@ -169,6 +171,7 @@ class TicketsCreate(BaseModel):
     completed_at: datetime = Field(default=datetime.now())
     asset_id: Optional[int] = Field(default=None)
 
+
 class TicketsOut(BaseModel):
     id: int
     issue_id: int
@@ -179,6 +182,7 @@ class TicketsOut(BaseModel):
     deleted_at: Optional[datetime]
     created_at: datetime
 
+
 # id, asset_id, result, description, completed_at, employee_id
 class InspectionsCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -188,6 +192,7 @@ class InspectionsCreate(BaseModel):
     description: str = Field(min_length=1, max_length=200)
     completed_at: datetime = Field(default=datetime.now())
     employee_id: int = Field()
+
 
 class InspectionsOut(BaseModel):
     id: int
@@ -220,75 +225,91 @@ def health() -> HealthResponse:
 @app.post("/employees", response_model=EmployeesOut, status_code=201)
 def create_employee(payload: EmployeesCreate) -> EmployeesOut:
     """Add an employee"""
-
+    q = """
+        INSERT INTO employees (first_name, last_name, email)
+        VALUES (%s, %s, %s)
+        RETURNING id, first_name, last_name, 
+        email, deleted_at, created
+    """
+    p = (
+        payload.first_name,
+        payload.last_name,
+        payload.email,
+    )
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            sql.SQL(
-                "INSERT INTO {table} ({fields}) VALUES ({values}) RETURNING {return_fields}"
-            ).format(
-                table=sql.Identifier("employees"),
-                fields=sql.SQL(",").join(
-                    [sql.Identifier("first_name"), sql.Identifier("last_name")]
-                ),
-                values=sql.SQL(",").join([payload.first_name, payload.last_name]),
-                return_fields=sql.SQL(",").join(
-                    [
-                        sql.Identifier("id"),
-                        sql.Identifier("first_name"),
-                        sql.Identifier("last_name"),
-                        sql.Identifier("deleted_at"),
-                        sql.Identifier("created"),
-                    ]
-                ),
-            ),
-            payload.model_dump(),
-        )
+        cur.execute(q, p)
         row = cur.fetchone()
         conn.commit()
 
     if row is None:
         raise HTTPException(status_code=500, detail="Failed to create employee")
 
+    id_out = row[0]
+    fname_out = row[1]
+    lname_out = row[2]
+    email_out = row[3]
+    del_out = row[4]
+    create_out = row[5]
+
+    with get_conn() as conn, conn.cursor() as cur:
+        q = """
+            INSERT INTO eid (eid, employee_id) 
+            VALUES (%s, %s) 
+            RETURNING eid
+        """
+        p = (
+            payload.eid,
+            id_out,
+        )
+        cur.execute(q, p)
+        row = cur.fetchone()
+        conn.commit()
+
+    if row is None:
+        raise HTTPException(status_code=500, detail="Failed to create eid table entry")
+
+    eid_out = row[0]
+
     return EmployeesOut(
-        id=row[0],
-        first_name=row[1],
-        last_name=row[2],
-        deleted_at=row[3],
-        created=row[4],
+        id=id_out,
+        eid=eid_out,
+        first_name=fname_out,
+        last_name=lname_out,
+        email=email_out,
+        deleted_at=del_out,
+        created=create_out,
     )
 
 
 @app.get("/employees/{employee_id}", response_model=EmployeesOut, status_code=201)
-def get_employee_by_id(employee_id: int) -> EmployeesOut:
+def get_employee_by_id(employee_id: str) -> EmployeesOut:
     """Get an employee by id"""
 
+    q = """
+        SELECT i.eid, e.id, e.first_name, e.last_name, 
+        e.email, e.deleted_at, e.created
+        FROM employees e LEFT JOIN eid i
+        ON i.employee_id = e.id WHERE i.eid = %s
+    """
+
+    p = (employee_id,)
+
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            sql.SQL("SELECT {fields} FROM {table} WHERE id={eid}").format(
-                fields=sql.SQL(",").join(
-                    [
-                        sql.Identifier("id"),
-                        sql.Identifier("first_name"),
-                        sql.Identifier("last_name"),
-                        sql.Identifier("deleted_at"),
-                        sql.Identifier("created"),
-                    ]
-                ),
-                table=sql.Identifier("employees"),
-                eid=employee_id,
-            )
-        )
+        cur.execute(q, p)
         row = cur.fetchone()
+        conn.commit()
 
     if row is None:
         raise HTTPException(status_code=500, detail="Failed to get employee")
 
     return EmployeesOut(
-        id=row[0],
-        first_name=row[1],
-        last_name=row[2],
-        deleted_at=row[3],
-        created=row[4],
+        eid=row[0],
+        id=row[1],
+        first_name=row[2],
+        last_name=row[3],
+        email=row[4],
+        deleted_at=row[5],
+        created=row[6],
     )
 
 
@@ -296,31 +317,28 @@ def get_employee_by_id(employee_id: int) -> EmployeesOut:
 def get_employee_list() -> list[EmployeesOut]:
     """List all employees"""
 
+    q = """
+        SELECT i.eid, e.id, e.first_name, e.last_name, 
+        e.email, e.deleted_at, e.created
+        FROM employees e LEFT JOIN eid i
+        ON i.employee_id = e.id ORDER BY e.last_name, 
+        e.first_name
+    """
+
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            sql.SQL("SELECT {fields} FROM {table} ORDER BY {order_col}").format(
-                fields=sql.SQL(",").join(
-                    [
-                        sql.Identifier("id"),
-                        sql.Identifier("first_name"),
-                        sql.Identifier("last_name"),
-                        sql.Identifier("deleted_at"),
-                        sql.Identifier("created"),
-                    ]
-                ),
-                table=sql.Identifier("employees"),
-                order_col=sql.Identifier("last_name"),
-            )
-        )
+        cur.execute(q)
         rows = cur.fetchall()
+        conn.commit()
 
     return [
         EmployeesOut(
-            id=row[0],
-            first_name=row[1],
-            last_name=row[2],
-            deleted_at=row[3],
-            created=row[4],
+            eid=row[0],
+            id=row[1],
+            first_name=row[2],
+            last_name=row[3],
+            email=row[4],
+            deleted_at=row[5],
+            created=row[6],
         )
         for row in rows
     ]
@@ -333,26 +351,14 @@ def create_asset(payload: AssetsCreate) -> AssetsOut:
 
     if payload.geometry_type == "point" and payload.point:
         query = """
-            INSERT INTO assets (
-                asset_type,
-                description,
-                estimated_value,
-                geom
-            )
-            VALUES (
-                %s,
-                %s,
-                %s,
+            INSERT INTO assets ( asset_type, description,
+                estimated_value, geom
+            ) VALUES ( %s, %s, %s,
                 ST_SetSRID(ST_MakePoint(%s, %s), 4326)
             )
             RETURNING
-                id,
-                asset_type,
-                description,
-                estimated_value,
-                ST_AsGeoJSON(geom),
-                deleted_at,
-                created
+                id, asset_type, description, estimated_value,
+                ST_AsGeoJSON(geom), deleted_at, created
         """
         params = (
             payload.asset_type,
@@ -371,26 +377,14 @@ def create_asset(payload: AssetsCreate) -> AssetsOut:
 
         query = """
             INSERT INTO assets (
-                asset_type,
-                description,
-                estimated_value,
-                geom
-            )
-            VALUES (
-                %s,
-                %s,
-                %s,
+                asset_type, description, estimated_value, geom
+            ) VALUES ( %s, %s, %s,
                 ST_GeomFromText(%s, 4326)
             )
-            RETURNING
-                id,
-                asset_type,
-                description,
-                estimated_value,
-                ST_AsGeoJSON(geom),
-                deleted_at,
-                created
+            RETURNING id, asset_type, description, estimated_value,
+                ST_AsGeoJSON(geom), deleted_at, created
         """
+
         params = (
             payload.asset_type,
             payload.description,
@@ -423,10 +417,11 @@ def create_asset(payload: AssetsCreate) -> AssetsOut:
 
 
 @app.get("/assets/{asset_id}", response_model=AssetsOut)
-def get_asset_by_id(asset_id: int) -> AssetsOut:
+def get_asset_by_id(asset_id: str) -> AssetsOut:
     """Get a single asset by ID"""
     query = """
-        SELECT id, asset_type, description, estimated_value, ST_AsGeoJSON(geom) AS geom, deleted_at, created
+        SELECT id, asset_type, description, estimated_value, 
+        ST_AsGeoJSON(geom) AS geom, deleted_at, created
         FROM assets WHERE id=%s;
     """
     params = (asset_id,)
@@ -456,7 +451,8 @@ def get_asset_by_id(asset_id: int) -> AssetsOut:
 def get_asset_list() -> list[AssetsOut]:
     """List all assets"""
     sql = """
-        SELECT id, asset_type, description, estimated_value, ST_AsGeoJSON(geom) AS geom, deleted_at, created
+        SELECT id, asset_type, description, estimated_value, 
+        ST_AsGeoJSON(geom) AS geom, deleted_at, created
         FROM assets ORDER BY id;
     """
 
@@ -485,11 +481,14 @@ def create_issue(payload: IssuesCreate) -> IssuesOut:
 
     query = """
         INSERT INTO issues (
-            issue_type, priority, status, asset_id, description, estimated_cost, reported_by
+            issue_type, priority, status, asset_id, description, 
+            estimated_cost, reported_by
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s
         ) RETURNING
-            id, issue_type, priority, status, asset_id, description, estimated_cost, reported_by, deleted_at, created;
+            id, issue_type, priority, status, asset_id, 
+            description, estimated_cost, reported_by, 
+            deleted_at, created;
     """
     params = (
         payload.issue_type,
@@ -526,7 +525,9 @@ def create_issue(payload: IssuesCreate) -> IssuesOut:
 def get_issue_by_id(issue_id: int) -> IssuesOut:
     """Get a single issue by ID"""
     q = """
-        SELECT id, issue_type, priority, status, asset_id, description, estimated_cost, reported_by, deleted_at, created
+        SELECT id, issue_type, priority, status, asset_id, 
+        description, estimated_cost, reported_by, 
+        deleted_at, created
         FROM issues WHERE id=%s;
     """
     p = (issue_id,)
@@ -556,7 +557,9 @@ def get_issue_by_id(issue_id: int) -> IssuesOut:
 def get_issue_list() -> list[IssuesOut]:
     """Get a list of issues"""
     sql = """
-        SELECT id, issue_type, priority, status, asset_id, description, estimated_cost, reported_by, deleted_at, created
+        SELECT id, issue_type, priority, status, asset_id, 
+        description, estimated_cost, reported_by, 
+        deleted_at, created
         FROM issues ORDER BY id;
     """
 
@@ -585,15 +588,23 @@ def get_issue_list() -> list[IssuesOut]:
 def update_issue(issue_id: int, payload: IssuesUpdate) -> IssuesOut:
 
     if payload.priority is None or payload.status is None:
-        raise HTTPException(status_code=500, detail="Must provide both status and priority for update for now")
+        raise HTTPException(
+            status_code=500,
+            detail="Must provide both status and priority for update for now",
+        )
 
     query = """
         UPDATE issues SET priority=%s, status=%s WHERE id = %s
         RETURNING id, issue_type, priority, status, asset_id, 
-        description, estimated_cost, reported_by, deleted_at, created;
+        description, estimated_cost, reported_by, deleted_at, 
+        created;
     """
 
-    params = (payload.priority, payload.status, issue_id,)
+    params = (
+        payload.priority,
+        payload.status,
+        issue_id,
+    )
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(query, params)
@@ -621,14 +632,22 @@ def update_issue(issue_id: int, payload: IssuesUpdate) -> IssuesOut:
 def create_ticket(payload: TicketsCreate) -> TicketsOut:
     q = """
         INSERT INTO tickets (
-            issue_id, work_description, employee_id, completed_at, asset_id
+            issue_id, work_description, employee_id, completed_at, 
+            asset_id
         ) VALUES (
             %s, %s, %s, %s, %s
         ) RETURNING
-            id, issue_id, work_description, employee_id, completed_at, asset_id, deleted_at, created;
+            id, issue_id, work_description, employee_id, 
+            completed_at, asset_id, deleted_at, created;
     """
 
-    p = (payload.issue_id, payload.work_description, payload.employee_id, payload.completed_at, payload.asset_id,)
+    p = (
+        payload.issue_id,
+        payload.work_description,
+        payload.employee_id,
+        payload.completed_at,
+        payload.asset_id,
+    )
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(q, p)
@@ -638,19 +657,27 @@ def create_ticket(payload: TicketsCreate) -> TicketsOut:
     if row is None:
         raise HTTPException(status_code=500, detail="Create ticket failed.")
 
-    return TicketsOut (
-        id=row[0], issue_id=row[1], work_description=row[2], employee_id=row[3], completed_at=row[4],
-        asset_id=row[5], deleted_at=row[6], created_at=row[7]
+    return TicketsOut(
+        id=row[0],
+        issue_id=row[1],
+        work_description=row[2],
+        employee_id=row[3],
+        completed_at=row[4],
+        asset_id=row[5],
+        deleted_at=row[6],
+        created_at=row[7],
     )
+
 
 @app.get("/tickets/{ticket_id}", response_model=TicketsOut)
 def get_ticket_by_id(ticket_id: int) -> TicketsOut:
     q = """
-        SELECT id, issue_id, work_description, employee_id, completed_at, asset_id, deleted_at, created
+        SELECT id, issue_id, work_description, employee_id, 
+        completed_at, asset_id, deleted_at, created
         FROM tickets WHERE id = %s;
     """
 
-    p = (ticket_id, )
+    p = (ticket_id,)
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(q, p)
@@ -660,15 +687,23 @@ def get_ticket_by_id(ticket_id: int) -> TicketsOut:
     if row is None:
         raise HTTPException(status_code=500, detail="GET ticket failed.")
 
-    return TicketsOut (
-        id=row[0], issue_id=row[1], work_description=row[2], employee_id=row[3], completed_at=row[4],
-        asset_id=row[5], deleted_at=row[6], created_at=row[7]
+    return TicketsOut(
+        id=row[0],
+        issue_id=row[1],
+        work_description=row[2],
+        employee_id=row[3],
+        completed_at=row[4],
+        asset_id=row[5],
+        deleted_at=row[6],
+        created_at=row[7],
     )
+
 
 @app.get("/tickets", response_model=list[TicketsOut])
 def get_ticket_list() -> list[TicketsOut]:
     q = """
-        SELECT id, issue_id, work_description, employee_id, completed_at, asset_id, deleted_at, created
+        SELECT id, issue_id, work_description, employee_id, 
+        completed_at, asset_id, deleted_at, created
         FROM tickets ORDER BY id;
     """
 
@@ -677,25 +712,41 @@ def get_ticket_list() -> list[TicketsOut]:
         rows = cur.fetchall()
         conn.commit()
 
-    return [ 
-        TicketsOut (
-            id=row[0], issue_id=row[1], work_description=row[2], employee_id=row[3], completed_at=row[4],
-            asset_id=row[5], deleted_at=row[6], created_at=row[7]
-        ) for row in rows
+    return [
+        TicketsOut(
+            id=row[0],
+            issue_id=row[1],
+            work_description=row[2],
+            employee_id=row[3],
+            completed_at=row[4],
+            asset_id=row[5],
+            deleted_at=row[6],
+            created_at=row[7],
+        )
+        for row in rows
     ]
+
 
 @app.post("/inspections", response_model=InspectionsOut)
 def create_inspection(payload: InspectionsCreate) -> InspectionsOut:
     q = """
         INSERT INTO inspections (
-            asset_id, result, description, completed_at, employee_id
+            asset_id, result, description, completed_at, 
+            employee_id
         ) VALUES (
             %s, %s, %s, %s, %s
         ) RETURNING
-            id, asset_id, result, description, completed_at, employee_id, deleted_at, created;
+            id, asset_id, result, description, completed_at, 
+            employee_id, deleted_at, created;
     """
 
-    p = (payload.asset_id, payload.result, payload.description, payload.completed_at, payload.employee_id,)
+    p = (
+        payload.asset_id,
+        payload.result,
+        payload.description,
+        payload.completed_at,
+        payload.employee_id,
+    )
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(q, p)
@@ -705,16 +756,24 @@ def create_inspection(payload: InspectionsCreate) -> InspectionsOut:
     if row is None:
         raise HTTPException(status_code=500, detail="inspection creation failed. ")
 
-    return InspectionsOut (
-        id=row[0], asset_id=row[1], result=row[2], description=row[3], completed_at=row[4],
-        employee_id=row[5], deleted_at=row[6], created_at=row[7]
+    return InspectionsOut(
+        id=row[0],
+        asset_id=row[1],
+        result=row[2],
+        description=row[3],
+        completed_at=row[4],
+        employee_id=row[5],
+        deleted_at=row[6],
+        created_at=row[7],
     )
+
 
 @app.get("/inspections/{inspection_id}", response_model=InspectionsOut)
 def get_inspection_by_id(inspection_id: int) -> InspectionsOut:
     q = """
         SELECT
-            id, asset_id, result, description, completed_at, employee_id, deleted_at, created
+            id, asset_id, result, description, completed_at, 
+            employee_id, deleted_at, created
         FROM inspections WHERE id = %s;
     """
 
@@ -728,16 +787,24 @@ def get_inspection_by_id(inspection_id: int) -> InspectionsOut:
     if row is None:
         raise HTTPException(status_code=404, detail="inspection get failed. ")
 
-    return InspectionsOut (
-        id=row[0], asset_id=row[1], result=row[2], description=row[3], completed_at=row[4],
-        employee_id=row[5], deleted_at=row[6], created_at=row[7]
+    return InspectionsOut(
+        id=row[0],
+        asset_id=row[1],
+        result=row[2],
+        description=row[3],
+        completed_at=row[4],
+        employee_id=row[5],
+        deleted_at=row[6],
+        created_at=row[7],
     )
+
 
 @app.get("/inspections", response_model=list[InspectionsOut])
 def get_inspection_list() -> list[InspectionsOut]:
     sql = """
         SELECT
-            id, asset_id, result, description, completed_at, employee_id, deleted_at, created
+            id, asset_id, result, description, completed_at, 
+            employee_id, deleted_at, created
         FROM inspections ORDER BY id;
     """
 
@@ -747,9 +814,15 @@ def get_inspection_list() -> list[InspectionsOut]:
         conn.commit()
 
     return [
-        InspectionsOut (
-            id=row[0], asset_id=row[1], result=row[2], description=row[3], completed_at=row[4],
-            employee_id=row[5], deleted_at=row[6], created_at=row[7]
+        InspectionsOut(
+            id=row[0],
+            asset_id=row[1],
+            result=row[2],
+            description=row[3],
+            completed_at=row[4],
+            employee_id=row[5],
+            deleted_at=row[6],
+            created_at=row[7],
         )
         for row in rows
     ]
