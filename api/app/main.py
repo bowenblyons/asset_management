@@ -66,17 +66,19 @@ class PointGeometryIn(BaseModel):
 class LineGeometryIn(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    linestring: list[tuple[float, float]] = Field(
+    linestring: list[tuple[float, float, float]] = Field(
         min_length=2, description="List of [lon,lat] pairs"
     )
 
     @model_validator(mode="after")
     def validate_coordinates(self) -> "LineGeometryIn":
-        for lon, lat in self.linestring:
+        for lon, lat, alt in self.linestring:
             if not (-180 <= lon <= 180):
                 raise ValueError(f"bad longitude: {lon}")
             if not (-90 <= lat <= 90):
                 raise ValueError(f"bad latitude: {lat}")
+            if not (-500 <= alt <= 9000):
+                raise ValueError(f"bad altitude: {alt}")
         return self
 
 
@@ -115,7 +117,7 @@ class PointGeometryOut(BaseModel):
 
 class LineGeometryOut(BaseModel):
     type: Literal["line"] = "line"
-    linestring: list[tuple[float, float]]
+    linestring: list[tuple[float, float, float]]
 
 
 class AssetsOut(BaseModel):
@@ -348,7 +350,7 @@ def get_employee_list() -> list[EmployeesOut]:
 @app.post("/assets", response_model=AssetsOut, status_code=201)
 def create_asset(payload: AssetsCreate) -> AssetsOut:
     """Add an asset entry"""
-
+    print(payload)
     if payload.geometry_type == "point" and payload.point:
         query = """
             INSERT INTO assets ( asset_type, description,
@@ -370,8 +372,8 @@ def create_asset(payload: AssetsCreate) -> AssetsOut:
 
     elif payload.geometry_type == "line" and payload.line:
         wkt = (
-            "LINESTRING("
-            + ", ".join(f"{lon} {lat}" for lon, lat in payload.line.linestring)
+            "LINESTRING ("
+            + ", ".join(f"{lon} {lat} {alt}" for lon, lat, alt in payload.line.linestring)
             + ")"
         )
 

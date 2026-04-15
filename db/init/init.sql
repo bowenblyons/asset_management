@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS assets (
     asset_type TEXT NOT NULL,
     description TEXT,
     estimated_value INTEGER,
-    geom geometry(Geometry, 4326) NOT NULL,
+    geom geometry(GeometryZ, 4326) NOT NULL,
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT check_geom
